@@ -30,9 +30,11 @@ import time
 import augmentations
 from models.cifar.allconv import AllConvNet
 import numpy as np
-from third_party.ResNeXt_DenseNet.models.densenet import densenet
-from third_party.ResNeXt_DenseNet.models.resnext import resnext29
-from third_party.WideResNet_pytorch.wideresnet import WideResNet
+from models.third_party.ResNeXt_DenseNet.models.densenet import densenet
+from models.third_party.ResNeXt_DenseNet.models.resnext import resnext29
+from models.third_party.WideResNet_pytorch.wideresnet import WideResNet
+from models.third_party.WideResNet_pytorch.resnet_cifar import resnet20
+from models.cifar.attentions.attender2 import Attender
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -53,8 +55,8 @@ parser.add_argument(
     '--model',
     '-m',
     type=str,
-    default='resnext',
-    choices=['wrn', 'allconv', 'densenet', 'resnext'],
+    default='attender',
+    choices=['attender', 'wrn', 'allconv', 'densenet', 'resnext'],
     help='Choose architecture.')
 # Optimization options
 parser.add_argument(
@@ -263,7 +265,7 @@ def test(net, test_loader):
       logits = net(images)
       loss = F.cross_entropy(logits, targets)
       pred = logits.data.max(1)[1]
-      total_loss += float(loss.data)
+      total_loss += float(loss.data) * images.shape[0]
       total_correct += pred.eq(targets.data).sum().item()
 
   return total_loss / len(test_loader.dataset), total_correct / len(
@@ -297,13 +299,16 @@ def main():
   torch.manual_seed(1)
   np.random.seed(1)
 
+  cudnn.benchmark = True
+
   # Load datasets
   train_transform = transforms.Compose(
       [transforms.RandomHorizontalFlip(),
        transforms.RandomCrop(32, padding=4)])
   preprocess = transforms.Compose(
       [transforms.ToTensor(),
-       transforms.Normalize([0.5] * 3, [0.5] * 3)])
+       transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+       #transforms.Normalize([0.5] * 3, [0.5] * 3)])
   test_transform = preprocess
 
   if args.dataset == 'cifar10':
@@ -345,6 +350,11 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
+  elif args.model == 'attender':
+    net = Attender(num_classes=num_classes)
+    
+  n_parameters = sum(p.numel() for p in net.parameters() if p.requires_grad)
+  print('number of params:', n_parameters)
 
   optimizer = torch.optim.SGD(
       net.parameters(),

@@ -1,21 +1,21 @@
 import torch
 from torch import nn
 from einops import rearrange, repeat
-from .layers import LMHSA, GMHCA, BatchNorm1d, QuickGELU
+from .layers import GMHCA, BatchNorm1d, QuickGELU, LayerNorm2d, LMHCA
 
 class ResidualLocalAttentionBlock(nn.Module):
     def __init__(self, dim, num_queries=16, num_heads=4, head_dim=64, multiplier=4, attn_window_size=3, stride=1, padding=1, qkv_bias=False, dropout=0.):
         super().__init__()
-        self.attend = LMHSA(dim, num_queries, num_heads, head_dim, attn_window_size, stride, qkv_bias, dropout)
-        self.bn1 = nn.BatchNorm2d(dim)
+        self.attend = LMHCA(dim, num_queries, num_heads, head_dim, attn_window_size, stride, qkv_bias, dropout)
+        self.bn1 = LayerNorm2d(dim) #nn.BatchNorm2d(dim)
         proj_dim = dim*multiplier
         self.proj = nn.Sequential(
             nn.Conv2d(dim, proj_dim, kernel_size=1),
-            nn.BatchNorm2d(proj_dim),
+            LayerNorm2d(proj_dim), #nn.BatchNorm2d(proj_dim),
             QuickGELU(),
             nn.Conv2d(proj_dim, dim, kernel_size=1)
         )
-        self.bn2 = nn.BatchNorm2d(dim)
+        self.bn2 = LayerNorm2d(dim) #nn.BatchNorm2d(dim)
 
     def forward(self, x: torch.Tensor):
         x = x + self.attend(self.bn1(x))
@@ -26,16 +26,17 @@ class CrossAttentionBlock(nn.Module):
     def __init__(self, num_queries, query_dim, context_dim, num_heads=4, multiplier=4, head_dim=64, qkv_bias=False, dropout=0., attention_type='dot'):
         super().__init__()
         self.attend = GMHCA(query_dim, context_dim, num_heads, head_dim, qkv_bias, dropout, attention_type)
-        self.norm_query = BatchNorm1d(query_dim)
-        self.norm_context = BatchNorm1d(context_dim)
+        self.norm_query = nn.LayerNorm(query_dim) #BatchNorm1d(query_dim)
+        self.norm_context = nn.LayerNorm(context_dim) #BatchNorm1d(context_dim)
         proj_dim = query_dim*multiplier
         self.proj = nn.Sequential(
             nn.Linear(query_dim, proj_dim),
-            BatchNorm1d(proj_dim),
+            # BatchNorm1d(proj_dim),
+            nn.LayerNorm(proj_dim),
             QuickGELU(),
             nn.Linear(proj_dim, query_dim)
         )
-        self.proj_norm = BatchNorm1d(query_dim)
+        self.proj_norm = nn.LayerNorm(query_dim) #BatchNorm1d(query_dim)
         self.query = nn.Parameter(torch.randn(num_queries, query_dim))
     
     def forward(self, context: torch.Tensor):

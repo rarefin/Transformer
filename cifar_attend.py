@@ -33,9 +33,10 @@ import numpy as np
 from models.third_party.ResNeXt_DenseNet.models.densenet import densenet
 from models.third_party.ResNeXt_DenseNet.models.resnext import resnext29
 from models.third_party.WideResNet_pytorch.wideresnet import WideResNet
+from models.third_party.WideResNet_pytorch.resnet_cifar import resnet20
 
 
-from models.cifar.attentions.attender import Attender
+from models.cifar.attentions.attender2 import Attender
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -46,6 +47,8 @@ from torch import nn
 from thop import profile
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+from utils.radam import RAdam, RAdam_4step, AdamW
+import torch.optim as optim
 
 def margin_loss(x, labels, size_average=True):
     batch_size = x.size(0)
@@ -72,7 +75,7 @@ parser.add_argument(
     '-m',
     type=str,
     default='attender',
-    choices=['attender', 'dualT', 'perceiver', 'vit', 'wrn', 'allconv', 'densenet', 'resnext'],
+    choices=['resnet20', 'attender', 'dualT', 'perceiver', 'vit', 'wrn', 'allconv', 'densenet', 'resnext'],
     help='Choose architecture.')
 # Optimization options
 parser.add_argument(
@@ -81,8 +84,21 @@ parser.add_argument(
     '--learning-rate',
     '-lr',
     type=float,
-    default=0.001,
+    default=0.1,
     help='Initial learning rate.')
+
+parser.add_argument('--optimizer', default='sgd', type=str, choices=['adam', 'adamw', 'radam', 'radam4s', 'sgd'])
+parser.add_argument('--beta1', default=0.9, type=float,
+                    help='beta1 for adam')
+parser.add_argument('--beta2', default=0.999, type=float,
+                    help='beta2 for adam')
+parser.add_argument('--warmup', default=0, type=float,
+                    help='warmup steps for adam')
+
+# 4 step options
+parser.add_argument('--update_all', action='store_true')
+parser.add_argument('--additional_four', action='store_true')
+
 parser.add_argument(
     '--batch-size', '-b', type=int, default=96, help='Batch size.')
 parser.add_argument('--eval-batch-size', type=int, default=128)
@@ -167,10 +183,10 @@ CORRUPTIONS = [
 ]
 
 
-def get_lr(step, total_steps, lr_max, lr_min):
-  """Compute learning rate according to cosine annealing schedule."""
-  return lr_min + (lr_max - lr_min) * 0.5 * (1 +
-                                             np.cos(step / total_steps * np.pi))
+# def get_lr(step, total_steps, lr_max, lr_min):
+#   """Compute learning rate according to cosine annealing schedule."""
+#   return lr_min + (lr_max - lr_min) * 0.5 * (1 +
+#                                              np.cos(step / total_steps * np.pi))
 
 
 def aug(image, preprocess):
@@ -281,7 +297,6 @@ def train(net, train_loader, optimizer, scheduler, criterion=None):
 
     loss.backward()
     optimizer.step()
-    scheduler.step()
     loss_ema = loss_ema * 0.9 + float(loss) * 0.1
     if i % args.print_freq == 0:
       print('Train Loss {:.3f}'.format(loss_ema))
@@ -300,7 +315,7 @@ def test(net, test_loader):
       logits = net(images)
       loss = F.cross_entropy(logits, targets)
       pred = logits.data.max(1)[1]
-      total_loss += float(loss.data)
+      total_loss += float(loss.data) * images.shape[0]
       total_correct += pred.eq(targets.data).sum().item()
 
   return total_loss / len(test_loader.dataset), total_correct / len(
@@ -352,33 +367,65 @@ def main():
   # random.seed(seed)
 
   cudnn.benchmark = True
+  
+  
+  normalize = [transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))]
+
+  augmentations = []
+  args.disable_aug = False
+  if not args.disable_aug:
+      from utils.autoaug import CIFAR10Policy
+      print("Using Auto augmentation....")
+      augmentations += [
+          CIFAR10Policy()
+      ]
+  augmentations += [
+      transforms.RandomHorizontalFlip(),
+      # transforms.RandomCrop(32, padding=4),
+      transforms.ToTensor(),
+      *normalize,
+  ]
+
+  augmentations = transforms.Compose(augmentations)
+  train_data = datasets.CIFAR10(
+        './data/cifar', train=True, transform=augmentations, download=True)
+
+  test_data = datasets.CIFAR10(
+      root='./data/cifar', train=False, download=True, transform=transforms.Compose([
+          transforms.ToTensor(),
+          *normalize,
+  ]))
+  
 
   # Load datasets
-  train_transform = transforms.Compose(
-      [transforms.RandomHorizontalFlip(),
-       transforms.RandomCrop(32, padding=4)])
-  preprocess = transforms.Compose(
-      [transforms.ToTensor(),
-       transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
-       #transforms.Normalize([0.5] * 3, [0.5] * 3)])
-  test_transform = preprocess
+  # train_transform = transforms.Compose(
+  #     [transforms.RandomHorizontalFlip(),
+  #      transforms.RandomCrop(32, padding=4)])
+  # preprocess = transforms.Compose(
+  #     [transforms.ToTensor(),
+  #      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+  #      #transforms.Normalize([0.5] * 3, [0.5] * 3)])
+  # test_transform = preprocess
 
-  if args.dataset == 'cifar10':
-    train_data = datasets.CIFAR10(
-        './data/cifar', train=True, transform=train_transform, download=True)
-    test_data = datasets.CIFAR10(
-        './data/cifar', train=False, transform=test_transform, download=True)
-    base_c_path = './data/cifar/CIFAR-10-C/'
-    num_classes = 10
-  else:
-    train_data = datasets.CIFAR100(
-        './data/cifar', train=True, transform=train_transform, download=True)
-    test_data = datasets.CIFAR100(
-        './data/cifar', train=False, transform=test_transform, download=True)
-    base_c_path = './data/cifar/CIFAR-100-C/'
-    num_classes = 100
+  # if args.dataset == 'cifar10':
+  #   train_data = datasets.CIFAR10(
+  #       './data/cifar', train=True, transform=train_transform, download=True)
+  #   test_data = datasets.CIFAR10(
+  #       './data/cifar', train=False, transform=test_transform, download=True)
+  #   base_c_path = './data/cifar/CIFAR-10-C/'
+  #   num_classes = 10
+  # else:
+  #   train_data = datasets.CIFAR100(
+  #       './data/cifar', train=True, transform=train_transform, download=True)
+  #   test_data = datasets.CIFAR100(
+  #       './data/cifar', train=False, transform=test_transform, download=True)
+  #   base_c_path = './data/cifar/CIFAR-100-C/'
+  #   num_classes = 100
 
-  train_data = AugMixDataset(train_data, preprocess, args.no_jsd, args.no_augmix)
+  # train_data = AugMixDataset(train_data, preprocess, args.no_jsd, args.no_augmix)
+  
+  num_classes = 10
+  base_c_path = './data/cifar/CIFAR-10-C/'
   train_loader = torch.utils.data.DataLoader(
       train_data,
       batch_size=args.batch_size,
@@ -402,6 +449,8 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
+  elif args.model == 'resnet20':
+    net = resnet20()
   elif args.model == 'attender':
     net = Attender(num_classes=num_classes)
     # input = torch.randn(1, 3, 32, 32)
@@ -419,6 +468,18 @@ def main():
   optimizer = torch.optim.Adam(
       net.parameters(),
       args.learning_rate)
+  
+  
+  if args.optimizer.lower() == 'sgd':
+        optimizer = optim.SGD(net.parameters(), lr=args.learning_rate, momentum=args.momentum, weight_decay=args.decay, nesterov=True)
+  elif args.optimizer.lower() == 'adam':
+        optimizer = optim.Adam(net.parameters(), lr=args.learning_rate) #, betas=(args.beta1, args.beta2), weight_decay=args.decay)
+  elif args.optimizer.lower() == 'radam':
+      optimizer = RAdam(net.parameters(), lr=args.learning_rate) #, betas=(args.beta1, args.beta2), weight_decay=args.decay)
+  elif args.optimizer.lower() == 'radam4s':
+      optimizer = RAdam_4step(net.parameters(), lr=args.learning_rate, betas=(args.beta1, args.beta2), weight_decay=args.decay, update_all=args.update_all, additional_four=args.additional_four)
+  elif args.optimizer.lower() == 'adamw':
+        optimizer = optim.AdamW(net.parameters(), lr=args.learning_rate) #, betas=(args.beta1, args.beta2), weight_decay=args.decay, warmup=args.warmup)
   
   n_parameters = sum(p.numel() for p in net.parameters() if p.requires_grad)
   print('number of params:', n_parameters)
@@ -448,13 +509,18 @@ def main():
     print('Mean Corruption Error: {:.3f}'.format(100 - 100. * test_c_acc))
     return
 
-  scheduler = torch.optim.lr_scheduler.LambdaLR(
-      optimizer,
-      lr_lambda=lambda step: get_lr(  # pylint: disable=g-long-lambda
-          step,
-          args.epochs * len(train_loader),
-          1,  # lr_lambda computes multiplicative factor
-          1e-6 / args.learning_rate))
+  # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+  
+  scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, threshold=0.0001, 
+                                                         threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=True)
+  
+  # scheduler = torch.optim.lr_scheduler.LambdaLR(
+  #     optimizer,
+  #     lr_lambda=lambda step: get_lr(  # pylint: disable=g-long-lambda
+  #         step,
+  #         args.epochs * len(train_loader),
+  #         1,  # lr_lambda computes multiplicative factor
+  #         1e-6 / args.learning_rate))
 
   if not os.path.exists(args.save):
     os.makedirs(args.save)
@@ -474,6 +540,7 @@ def main():
     criterion = None #"margin_loss"
     train_loss_ema = train(net, train_loader, optimizer, scheduler, criterion=criterion)
     test_loss, test_acc = test(net, test_loader)
+    scheduler.step(test_loss)
 
     is_best = test_acc > best_acc
     best_acc = max(test_acc, best_acc)

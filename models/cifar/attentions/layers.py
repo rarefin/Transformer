@@ -9,6 +9,23 @@ from einops import rearrange, repeat
 import torch.nn.init as init
 
 
+# class QuickGELU(nn.Module):
+#     def __init__(self, dim=1, alpha=1.0, epsilon=1e-7):
+#         super().__init__()
+#         self.dim = dim
+#         self.alpha = alpha
+#         self.epsilon = epsilon
+    
+#     def forward(self, x):
+#         squared_norm = x.pow(2).sum(dim=self.dim, keepdim=True)
+#         norm = torch.sqrt(squared_norm + self.epsilon)
+        
+#         # squash_factor = squared_norm / (1. + squared_norm)
+#         # unit_vector = x / norm
+        
+#         return self.alpha * torch.sigmoid(1.702 * norm) * x 
+
+
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
@@ -40,23 +57,25 @@ class LayerNorm2d(nn.Module):
       
 
 class Squash(nn.Module):
-    def __init__(self, dim, alpha=1.0, epsilon=1e-7):
+    def __init__(self, dim, epsilon=1e-7):
         super().__init__()
         self.dim = dim
-        self.alpha = alpha
         self.epsilon = epsilon
     
-    def forward(self, x):
-        squared_norm = x.pow(2).sum(dim=self.dim, keepdim=True)
-        norm = torch.sqrt(squared_norm + self.epsilon)
+    def forward(self, x, alpha=1.0):
+        # squared_norm = x.pow(2).sum(dim=self.dim, keepdim=True)
+        # norm = torch.sqrt(squared_norm + self.epsilon)
         
-        squash_factor = squared_norm / (1. + squared_norm)
-        unit_vector = x / norm
+        # squash_factor = squared_norm / (1. + squared_norm)
         
-        return self.alpha * squash_factor * unit_vector  
+        # # print(squash_factor.shape)
+        # # print(alpha.shape)
+        # unit_vector = x / norm
+        
+        return alpha * x #squash_factor * unit_vector  
       
       
-class LMHSA(nn.Module):
+class LMHCA(nn.Module):
     def __init__(self, dim, num_queries=16, num_heads=4, head_dim=64, attn_window_size=3, stride=1, qkv_bias=False, dropout=0.):
         super().__init__()
         padding=attn_window_size//2
@@ -104,8 +123,9 @@ class LMHSA(nn.Module):
         attn = self.unfold(attn)
         attn = rearrange(attn, 'b (n k) h w ... -> b n h w k (...)', n=self.num_heads)
         
-        # squash_factor = attn.mean(dim=-1, keepdim=True)
-        # squash_factor = torch.sigmoid(squash_factor)
+        # squash_factor = torch.sigmoid(attn)
+        # squash_factor = squash_factor.mean(dim=[-1, 1], keepdim=True)
+        # squash_factor = rearrange(squash_factor, 'b f h w k e -> (b k) (e f) h w')
         # squash_factor = torch.where(squash_factor > torch.Tensor([0.5]).cuda(), torch.Tensor([1.]).cuda(), torch.Tensor([0.]).cuda())
         
         
@@ -118,11 +138,68 @@ class LMHSA(nn.Module):
         out = rearrange(out, 'b n h w k d -> (b k) (n d) h w')
         out = self.head_proj(out)
         
-        # out = self.squash(out)
+        # out = squash_factor * out #self.squash(out, alpha=squash_factor)
         out = rearrange(out, '(b k) d h w -> b (k d) h w', k=self.num_queries)
         out = self.query_proj(out)
         
         return out
+    
+
+class LMHSA(nn.Module):
+    def __init__(self, dim, num_heads=4, head_dim=64, attn_window_size=3, stride=1, qkv_bias=False, dropout=0.):
+        super().__init__()
+        padding=attn_window_size//2
+        self.padding = padding
+        self.attn_window_size = attn_window_size
+        self.stride = stride
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = head_dim ** -0.5
+        
+        proj_dim = head_dim * num_heads
+        self.proj_dim = proj_dim
+        self.qkv = nn.Conv2d(dim, proj_dim*3, kernel_size=1, bias=qkv_bias)
+        self.head_proj = nn.Sequential(
+            nn.Conv2d(proj_dim, dim, kernel_size=1),
+            nn.Dropout(dropout)
+        )
+      
+    def unfold(self, x):
+        x = F.pad(x, [self.padding, self.padding, self.padding, self.padding])
+        x = x.unfold(2, self.attn_window_size, self.stride).unfold(3, self.attn_window_size, self.stride)
+        
+        return x
+      
+    def forward(self, x):
+        b, c, h, w = x.shape
+        
+        k, v = self.kv(x).chunk(2, dim=1)
+        
+        attn = self.dot_product(k)
+        attn = self.unfold(attn)
+        attn = rearrange(attn, 'b (n k) h w ... -> b n h w k (...)', n=self.num_heads)
+        
+        # squash_factor = torch.sigmoid(attn)
+        # squash_factor = squash_factor.mean(dim=[-1, 1], keepdim=True)
+        # squash_factor = rearrange(squash_factor, 'b f h w k e -> (b k) (e f) h w')
+        # squash_factor = torch.where(squash_factor > torch.Tensor([0.5]).cuda(), torch.Tensor([1.]).cuda(), torch.Tensor([0.]).cuda())
+        
+        
+        v = self.unfold(v)
+        v = rearrange(v, 'b (n d) h w ... -> b n h w (...) d', n=self.num_heads)
+
+        attn = attn.softmax(dim=-1) 
+        out  = einsum('b n h w k l, b n h w l d -> b n h w k d', attn, v)
+        
+        out = rearrange(out, 'b n h w k d -> (b k) (n d) h w')
+        out = self.head_proj(out)
+        
+        # out = squash_factor * out #self.squash(out, alpha=squash_factor)
+        out = rearrange(out, '(b k) d h w -> b (k d) h w', k=self.num_queries)
+        out = self.query_proj(out)
+        
+        return out    
+
       
 class GMHCA(nn.Module):
     def __init__(self, query_dim, context_dim, num_heads=4, head_dim=64, qkv_bias=False, dropout=0., attention_type='dot'):
